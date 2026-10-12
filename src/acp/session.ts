@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
+import { parsePermissionGateRequest, type PermissionGateRequest } from './permissions.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { bashCommand, bashExitCode, bashOutputDelta, bashResultText, isBashTool } from './translate/bash.js'
@@ -181,9 +182,7 @@ export class SessionManager {
         cwd: params.cwd,
         mcpServers: params.mcpServers,
         piCommand: params.piCommand,
-        ...(process.env.PI_ACP_PI_ENTRYPOINT
-          ? { piEntrypoint: process.env.PI_ACP_PI_ENTRYPOINT }
-          : {})
+        ...(process.env.PI_ACP_PI_ENTRYPOINT ? { piEntrypoint: process.env.PI_ACP_PI_ENTRYPOINT } : {})
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -290,6 +289,7 @@ export class PiAcpSession {
   private fileSnapshots = new Map<string, { path: string; oldText: string | null }>()
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
+  private cancelledGateToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
@@ -505,6 +505,7 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+    this.cancelledGateToolCallIds.delete(toolCallId)
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -772,6 +773,20 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
 
+        // The gate blocks a cancelled call with its "denied" reason; report what actually happened.
+        if (this.cancelledGateToolCallIds.has(toolCallId)) {
+          this.emit({
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: 'failed',
+            content: [
+              { type: 'content', content: { type: 'text', text: 'Tool call was cancelled.' } }
+            ] satisfies ToolCallContent[]
+          })
+          this.cleanupToolCall(toolCallId)
+          break
+        }
+
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)
         if (this.bashToolCallIds.has(toolCallId)) {
@@ -1004,6 +1019,12 @@ export class PiAcpSession {
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
+    const gate = parsePermissionGateRequest(ev.message)
+    if (gate) {
+      await this.handlePermissionGate(id, gate)
+      return
+    }
+
     const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
     if (selected === null) {
       return
@@ -1015,6 +1036,53 @@ export class PiAcpSession {
     }
 
     await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
+  }
+
+  // Ask about the gated pi tool call itself, so clients see its real id, kind and structured
+  // input, and its status stays pending until the user answers.
+  private async handlePermissionGate(id: string, gate: PermissionGateRequest): Promise<void> {
+    const known = this.currentToolCalls.has(gate.toolCallId)
+    const toolCallId = known ? gate.toolCallId : `pi-ui-${id}`
+    if (known) {
+      this.currentToolCalls.set(toolCallId, 'pending')
+      this.emit({ sessionUpdate: 'tool_call_update', toolCallId, status: 'pending' })
+    }
+
+    const toolCall = {
+      toolCallId,
+      title: (isBashTool(gate.toolName) ? bashCommand(gate.input) : null) ?? gate.toolName,
+      kind: toToolKind(gate.toolName),
+      status: 'pending' as const,
+      locations: toToolCallLocations(gate.input, this.cwd),
+      rawInput: gate.input
+    }
+
+    let selected: PermissionResponse
+    try {
+      await this.flushEmits()
+      selected = await this.conn.requestPermission({
+        sessionId: this.sessionId,
+        toolCall,
+        options: CONFIRM_PERMISSION_OPTIONS
+      })
+    } catch {
+      if (known) this.cancelledGateToolCallIds.add(toolCallId)
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    if (selected.outcome.outcome === 'cancelled') {
+      if (known) this.cancelledGateToolCallIds.add(toolCallId)
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    const confirmed = selected.outcome.optionId === 'yes'
+    if (confirmed && known) {
+      this.currentToolCalls.set(toolCallId, 'in_progress')
+      this.emit({ sessionUpdate: 'tool_call_update', toolCallId, status: 'in_progress' })
+    }
+    await this.proc.sendExtensionUiResponse({ id, confirmed })
   }
 
   private async requestExtensionPermission(

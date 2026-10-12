@@ -8,6 +8,8 @@ export type PermissionGateLaunch = {
   cleanup(): void
 }
 
+export const PERMISSION_GATE_MARKER = 'piAcpPermissionGate'
+
 const PERMISSION_EXTENSION = `export default function permissionGate(pi) {
   const guardedTools = new Set(['bash', 'edit', 'write'])
 
@@ -17,8 +19,13 @@ const PERMISSION_EXTENSION = `export default function permissionGate(pi) {
       return { block: true, reason: 'Permission approval is unavailable for this tool call.' }
     }
 
-    const input = JSON.stringify(event.input ?? {}, null, 2)
-    const detail = input.length > 4000 ? input.slice(0, 4000) + '\\n…' : input
+    // The adapter recognizes this envelope and asks about the real tool call (id, kind, input).
+    const detail = JSON.stringify({
+      ${PERMISSION_GATE_MARKER}: 1,
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      input: event.input ?? {}
+    })
     const confirmed = await ctx.ui.confirm('Allow ' + event.toolName + '?', detail)
     if (!confirmed) return { block: true, reason: 'Tool call was denied by the user.' }
   })
@@ -46,4 +53,27 @@ export function preparePermissionGateLaunch(env = process.env): PermissionGateLa
       rmSync(extensionDir, { recursive: true, force: true })
     }
   }
+}
+
+export type PermissionGateRequest = {
+  toolCallId: string
+  toolName: string
+  input: Record<string, unknown>
+}
+
+export function parsePermissionGateRequest(message: unknown): PermissionGateRequest | null {
+  if (typeof message !== 'string') return null
+  let value: unknown
+  try {
+    value = JSON.parse(message)
+  } catch {
+    return null
+  }
+  if (!value || typeof value !== 'object') return null
+  const v = value as Record<string, unknown>
+  if (v[PERMISSION_GATE_MARKER] !== 1) return null
+  if (typeof v.toolCallId !== 'string' || !v.toolCallId) return null
+  if (typeof v.toolName !== 'string' || !v.toolName) return null
+  const input = v.input && typeof v.input === 'object' && !Array.isArray(v.input) ? v.input : {}
+  return { toolCallId: v.toolCallId, toolName: v.toolName, input: input as Record<string, unknown> }
 }

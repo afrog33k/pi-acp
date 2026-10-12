@@ -940,3 +940,108 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
   const reason = await p
   assert.equal(reason, 'end_turn')
 })
+
+function gateConfirm(id: string, toolCallId: string, toolName: string, input: Record<string, unknown>) {
+  return {
+    type: 'extension_ui_request',
+    id,
+    method: 'confirm',
+    title: `Allow ${toolName}?`,
+    message: JSON.stringify({ piAcpPermissionGate: 1, toolCallId, toolName, input })
+  }
+}
+
+function gateSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess) {
+  return new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+}
+
+test('PiAcpSession: permission gate asks about the real tool call and keeps it pending', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextPermissionResponse = { outcome: { outcome: 'selected', optionId: 'yes' } }
+  const proc = new FakePiRpcProcess()
+  gateSession(conn, proc)
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'call_1', toolName: 'bash', args: { command: 'mkdir x' } })
+  proc.emit(gateConfirm('ui-1', 'call_1', 'bash', { command: 'mkdir x' }))
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.permissionRequests.length, 1)
+  const toolCall = (conn.permissionRequests[0] as any).toolCall
+  assert.equal(toolCall.toolCallId, 'call_1')
+  assert.equal(toolCall.kind, 'execute')
+  assert.equal(toolCall.title, 'mkdir x')
+  assert.equal(toolCall.status, 'pending')
+  assert.deepEqual(toolCall.rawInput, { command: 'mkdir x' })
+
+  const statuses = conn.updates.map(u => (u.update as any).status)
+  assert.deepEqual(statuses, ['in_progress', 'pending', 'in_progress'])
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-1', confirmed: true }])
+})
+
+test('PiAcpSession: permission gate maps edit and write to kind edit with locations', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextPermissionResponse = { outcome: { outcome: 'selected', optionId: 'no' } }
+  const proc = new FakePiRpcProcess()
+  gateSession(conn, proc)
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'call_2',
+    toolName: 'write',
+    args: { path: 'a.txt', content: 'hi' }
+  })
+  proc.emit(gateConfirm('ui-2', 'call_2', 'write', { path: 'a.txt', content: 'hi' }))
+  await new Promise(r => setTimeout(r, 0))
+
+  const toolCall = (conn.permissionRequests[0] as any).toolCall
+  assert.equal(toolCall.toolCallId, 'call_2')
+  assert.equal(toolCall.kind, 'edit')
+  assert.equal(toolCall.locations[0].path.endsWith('a.txt'), true)
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-2', confirmed: false }])
+})
+
+test('PiAcpSession: permission gate reports a cancelled call as cancelled, not denied', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextPermissionResponse = { outcome: { outcome: 'cancelled' } }
+  const proc = new FakePiRpcProcess()
+  gateSession(conn, proc)
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'call_3', toolName: 'bash', args: { command: 'rm -rf build' } })
+  proc.emit(gateConfirm('ui-3', 'call_3', 'bash', { command: 'rm -rf build' }))
+  await new Promise(r => setTimeout(r, 0))
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'call_3',
+    isError: true,
+    result: { content: [{ type: 'text', text: 'Tool call was denied by the user.' }] }
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-3', cancelled: true }])
+  const last = conn.updates.at(-1)!.update as any
+  assert.equal(last.status, 'failed')
+  assert.deepEqual(last.content, [{ type: 'content', content: { type: 'text', text: 'Tool call was cancelled.' } }])
+})
+
+test('PiAcpSession: permission gate for an unannounced call keeps its kind and input', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextPermissionResponse = { outcome: { outcome: 'selected', optionId: 'no' } }
+  const proc = new FakePiRpcProcess()
+  gateSession(conn, proc)
+
+  proc.emit(gateConfirm('ui-4', 'call_unknown', 'bash', { command: 'ls' }))
+  await new Promise(r => setTimeout(r, 0))
+
+  const toolCall = (conn.permissionRequests[0] as any).toolCall
+  assert.equal(toolCall.toolCallId, 'pi-ui-ui-4')
+  assert.equal(toolCall.kind, 'execute')
+  assert.deepEqual(toolCall.rawInput, { command: 'ls' })
+  assert.equal(conn.updates.length, 0)
+})
