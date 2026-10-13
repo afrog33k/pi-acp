@@ -28,6 +28,15 @@ test('preparePermissionGateLaunch materializes and cleans up the extension', () 
   launch.cleanup()
 })
 
+test('preparePermissionGateLaunch keeps the project untrusted', () => {
+  // A trusted project loads .pi/extensions, which run code at load time without asking.
+  const launch = preparePermissionGateLaunch({ PI_ACP_PERMISSION_GATE: '1' })
+  assert.ok(launch)
+  assert.ok(launch.args.includes('--no-approve'))
+  assert.equal(launch.args.includes('--approve'), false)
+  launch.cleanup()
+})
+
 test('preparePermissionGateLaunch maps its guest path for an AgentOS child', () => {
   const launch = preparePermissionGateLaunch({
     PI_ACP_PERMISSION_GATE: '1',

@@ -46,7 +46,9 @@ export function preparePermissionGateLaunch(env = process.env): PermissionGateLa
 
   let cleaned = false
   return {
-    args: ['--extension', childVisiblePath(extensionPath, env)],
+    // --no-approve keeps the project untrusted, so a repo's .pi/ extensions (code that runs at load, before any
+    // tool call reaches the gate) never load, whatever pi's trust default or stored decision says.
+    args: ['--extension', childVisiblePath(extensionPath, env), '--no-approve'],
     cleanup() {
       if (cleaned) return
       cleaned = true
