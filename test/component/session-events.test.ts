@@ -1045,3 +1045,55 @@ test('PiAcpSession: permission gate for an unannounced call keeps its kind and i
   assert.deepEqual(toolCall.rawInput, { command: 'ls' })
   assert.equal(conn.updates.length, 0)
 })
+
+// A client-held grant (Elyra D132: per agent, time-bounded, revocable) answers gate requests itself. The adapter must
+// keep no approval state of its own, so a revoke or expiry takes effect on the very next call.
+test('PiAcpSession: permission gate offers only once-options and asks again for every call', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextPermissionResponse = { outcome: { outcome: 'selected', optionId: 'yes' } }
+  const proc = new FakePiRpcProcess()
+  gateSession(conn, proc)
+
+  for (const n of [1, 2]) {
+    proc.emit({ type: 'tool_execution_start', toolCallId: `call_${n}`, toolName: 'bash', args: { command: 'ls' } })
+    proc.emit(gateConfirm(`ui-${n}`, `call_${n}`, 'bash', { command: 'ls' }))
+    await new Promise(r => setTimeout(r, 0))
+  }
+
+  assert.equal(conn.permissionRequests.length, 2)
+  for (const req of conn.permissionRequests as any[]) {
+    assert.deepEqual(
+      req.options.map((o: { kind: string }) => o.kind),
+      ['allow_once', 'reject_once']
+    )
+  }
+  assert.deepEqual(proc.extensionUiResponses, [
+    { id: 'ui-1', confirmed: true },
+    { id: 'ui-2', confirmed: true }
+  ])
+})
+
+// A receipt for an approved call binds to the asked toolCallId and reads its outcome from that same id.
+test('PiAcpSession: an approved gated call completes under the id it was asked about', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextPermissionResponse = { outcome: { outcome: 'selected', optionId: 'yes' } }
+  const proc = new FakePiRpcProcess()
+  gateSession(conn, proc)
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'call_7', toolName: 'bash', args: { command: 'mkdir x' } })
+  proc.emit(gateConfirm('ui-7', 'call_7', 'bash', { command: 'mkdir x' }))
+  await new Promise(r => setTimeout(r, 0))
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'call_7',
+    isError: false,
+    result: { content: [{ type: 'text', text: '' }] }
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal((conn.permissionRequests[0] as any).toolCall.toolCallId, 'call_7')
+  const last = conn.updates.at(-1)!.update as any
+  assert.equal(last.toolCallId, 'call_7')
+  assert.equal(last.status, 'completed')
+  assert.equal(last.rawOutput.exitCode, 0)
+})
